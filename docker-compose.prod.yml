@@ -1,0 +1,109 @@
+# Production stack: one public address (HTTPS) -> web (Caddy) -> backend. Database and Redis are NOT reachable from outside.
+# Start with:  ./scripts/prod.sh up -d --build        (it adds --env-file .env.prod for you)
+name: reel
+
+x-logging: &logging
+  driver: json-file
+  options: { max-size: "10m", max-file: "3" }
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: always
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-reel}
+      POSTGRES_USER: ${POSTGRES_USER:-reel}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env.prod}
+    volumes:
+      - reel_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    logging: *logging
+
+  redis:
+    image: redis:7-alpine
+    restart: always
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - reel_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    logging: *logging
+
+  backend:
+    build: ./backend
+    restart: always
+    # --proxy-headers: log and rate-limit the visitor's real IP (Caddy passes it on), not Caddy's.
+    command: ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --proxy-headers --forwarded-allow-ips='*'"]
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-reel}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-reel}
+      REDIS_URL: redis://redis:6379/0
+      SECRET_KEY: ${SECRET_KEY:?Set SECRET_KEY in .env.prod}
+      ACCESS_TOKEN_EXPIRE_MINUTES: ${ACCESS_TOKEN_EXPIRE_MINUTES:-60}
+      BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:?Set BOOTSTRAP_ADMIN_EMAIL in .env.prod}
+      BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:?Set BOOTSTRAP_ADMIN_PASSWORD in .env.prod}
+      BOOTSTRAP_ADMIN_NAME: ${BOOTSTRAP_ADMIN_NAME:-REEL Admin}
+      UPLOAD_DIR: /data/uploads
+      MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-200}
+      ENABLE_DOCS: ${ENABLE_DOCS:-false}
+      CORS_ORIGINS: https://${DOMAIN:?Set DOMAIN in .env.prod}
+    volumes:
+      - reel_uploads:/data/uploads
+    depends_on:
+      db: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=4)"]
+      interval: 30s
+      timeout: 6s
+      retries: 3
+      start_period: 60s
+    logging: *logging
+
+  # Background worker (video validation). Run exactly one worker container: it embeds the job scheduler (-B).
+  worker:
+    build: ./backend
+    restart: always
+    command: ["celery", "-A", "app.worker.celery_app:celery_app", "worker", "-B", "--loglevel=INFO", "--concurrency=${WORKER_CONCURRENCY:-1}"]
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-reel}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-reel}
+      REDIS_URL: redis://redis:6379/0
+      UPLOAD_DIR: /data/uploads
+      JOB_TIMEOUT_SECONDS: ${JOB_TIMEOUT_SECONDS:-900}
+    volumes:
+      - reel_uploads:/data/uploads
+    depends_on:
+      backend: { condition: service_healthy }
+    logging: *logging
+
+  # The only public service: serves the built web app and forwards /api to the backend. Gets the HTTPS certificate automatically.
+  web:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.prod
+    restart: always
+    environment:
+      DOMAIN: ${DOMAIN}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      backend: { condition: service_healthy }
+    logging: *logging
+
+volumes:
+  reel_postgres_data:
+  reel_redis_data:
+  reel_uploads:
+  caddy_data:
+  caddy_config:

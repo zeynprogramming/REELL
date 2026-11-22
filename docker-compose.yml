@@ -1,0 +1,91 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-reel}
+      POSTGRES_USER: ${POSTGRES_USER:-reel}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-reel_password}
+    volumes:
+      - reel_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    ports:
+      - "127.0.0.1:5432:5432"
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - reel_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    ports:
+      - "127.0.0.1:6379:6379"
+
+  backend:
+    build: ./backend
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://reel:reel_password@db:5432/reel}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173}
+      SECRET_KEY: ${SECRET_KEY:?Set SECRET_KEY in .env (see .env.example)}
+      ACCESS_TOKEN_EXPIRE_MINUTES: ${ACCESS_TOKEN_EXPIRE_MINUTES:-60}
+      BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:-}
+      BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:-}
+      BOOTSTRAP_ADMIN_NAME: ${BOOTSTRAP_ADMIN_NAME:-REEL Admin}
+      UPLOAD_DIR: /data/uploads
+      MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-2048}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+    volumes:
+      - reel_uploads:/data/uploads
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+
+  # Background worker: runs processing jobs from the Redis queue. Same image as the API.
+  # "-B" embeds the scheduler that fails stuck jobs; run exactly ONE worker container with -B.
+  worker:
+    build: ./backend
+    restart: unless-stopped
+    command: ["celery", "-A", "app.worker.celery_app:celery_app", "worker", "-B", "--loglevel=INFO", "--concurrency=${WORKER_CONCURRENCY:-2}"]
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://reel:reel_password@db:5432/reel}
+      UPLOAD_DIR: /data/uploads
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      JOB_TIMEOUT_SECONDS: ${JOB_TIMEOUT_SECONDS:-900}
+    volumes:
+      - reel_uploads:/data/uploads
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      backend:
+        condition: service_started
+
+  frontend:
+    build: ./frontend
+    restart: unless-stopped
+    environment:
+      VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:8000}
+    depends_on:
+      - backend
+    ports:
+      - "5173:5173"
+
+volumes:
+  reel_postgres_data:
+  reel_uploads:
+  reel_redis_data:

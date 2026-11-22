@@ -1,0 +1,13 @@
+# Stage 1: build the web app (type-checks, then bundles). API base stays empty = same address as the page.
+FROM node:20-alpine AS build
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci
+COPY . .
+ENV VITE_API_BASE_URL=
+RUN npm run build
+
+# Stage 2: Caddy serves the files, forwards /api, and obtains the HTTPS certificate.
+FROM caddy:2-alpine
+COPY Caddyfile /etc/caddy/Caddyfile
+COPY --from=build /app/dist /srv
